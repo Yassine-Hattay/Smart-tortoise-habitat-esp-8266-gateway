@@ -9,7 +9,7 @@ const char *ssid = "Orange-066C";
 const char *password = "GMA6ABLMG87";
 
 void setup() {
-  Serial.begin(115'200);
+  Serial.begin(115'200); 
   Serial1.begin(115'200, SERIAL_8N1, SERIAL_FULL, 2);
 
   pinMode(CLOCK_PIN, INPUT);
