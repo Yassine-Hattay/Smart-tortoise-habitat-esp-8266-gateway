@@ -3,7 +3,6 @@
 static bool humidifierFansOn = false;
 static bool humidifierOn = false;
 
-
 static const char *espSecretKey =
     "RRbp5ChK6CQH4Nkwo0PdfglrjJDOdBzbC5wn5IfCRlA2XtXPtePItOVm2q5y61y6Q4HaNn5uG2"
     "5gys1Zywd753wLddYPmm6ChHyrZZCZEru7Bpu3fI9aHxCWyuMGqwNy";
@@ -12,8 +11,67 @@ static String lastStatusMsg = "";
 
 String commandString = "";
 
+// Helper to get UNIX timestamp on ESP8266 (assuming time is synchronized)
+unsigned long getUnixTime() {
+  return (unsigned long)time(nullptr); // requires time synchronization setup
+}
+
+// Helper to check timestamp freshness (maxAgeSeconds = 10 seconds)
+bool isTimestampFresh(unsigned long ts) {
+  unsigned long now = getUnixTime();
+  if (ts > now)
+    return false; // future timestamp not allowed
+  if ((now - ts) > 10)
+    return false; // older than 10 seconds -> stale
+  return true;
+}
+
+unsigned long extractTimestamp(const String &cmd) {
+  int tsIndex = cmd.indexOf(";ts=");
+  if (tsIndex == -1)
+    return 0;
+  String tsStr = cmd.substring(tsIndex + 4);
+  tsStr.trim();
+  Serial.println("Timestamp substring extracted: '" + tsStr + "'");
+  return tsStr.toInt();
+}
+
+// Remove the ";ts=TIMESTAMP" part from command string
+String stripTimestamp(const String &cmd) {
+  int tsIndex = cmd.indexOf(";ts=");
+  if (tsIndex == -1)
+    return cmd;
+  return cmd.substring(0, tsIndex);
+}
+
+// URL decode function for decoding command string from POST data
+String urlDecode(const String &input) {
+  String decoded = "";
+  char temp[] = "0x00";
+  unsigned int len = input.length();
+  unsigned int i = 0;
+
+  while (i < len) {
+    char c = input.charAt(i);
+    if (c == '+') {
+      decoded += ' ';
+    } else if (c == '%') {
+      if (i + 2 < len) {
+        temp[2] = input.charAt(i + 1);
+        temp[3] = input.charAt(i + 2);
+        decoded += (char)strtol(temp, NULL, 16);
+        i += 2;
+      }
+    } else {
+      decoded += c;
+    }
+    i++;
+  }
+  return decoded;
+}
+
 void handleClient() {
-  WiFiClient client = server.available(); 
+  WiFiClient client = server.available();
   if (!client)
     return;
 
@@ -40,24 +98,47 @@ void handleClient() {
   }
 
   if (isPost) {
-    String cmdBase = "";
-    String cmdToSTM = "";
+    String cmdBase = "";  // will contain command WITH timestamp (for HMAC)
+    String cmdToSTM = ""; // command without timestamp, to send to STM32
     bool performDownload = false;
 
-    if (postData.indexOf("command=download_firmware") >= 0) {
-      cmdBase = "Download Firmware";
-      performDownload = true;
-    } else if (postData.indexOf("command=toggle_fans") >= 0) {
-      cmdBase = humidifierFansOn ? "Humidfier Fans OFF" : "Humidfier Fans ON";
-      cmdToSTM = cmdBase + "\n";
-    } else if (postData.indexOf("command=toggle_humidifier") >= 0) {
-      cmdBase = humidifierOn ? "Humidfier OFF" : "Humidfier ON";
-      cmdToSTM = cmdBase + "\n";
-    } else if (postData.indexOf("command=automated_mode") >= 0) {
-      cmdBase = "End esp Task";
-      cmdToSTM = cmdBase + "\n";
+    String receivedCmdEncoded = getPostValue(postData, "command");
+    Serial.println("Received command (encoded): " + receivedCmdEncoded);
+
+    String onceDecoded = urlDecode(receivedCmdEncoded);
+    Serial.println("Once decoded: " + onceDecoded);
+
+    String receivedCmd = urlDecode(onceDecoded);
+    Serial.println("Fully decoded: " + receivedCmd);
+
+    unsigned long ts = extractTimestamp(receivedCmd);
+    Serial.printf("Extracted timestamp: %lu\n", ts);
+
+    if (ts == 0 || !isTimestampFresh(ts)) {
+      Serial.println("❌ Timestamp missing or not fresh, rejecting command");
+      lastStatusMsg =
+          "<p style='color:red;'>❌ Command timestamp missing or expired.</p>";
+      goto SEND_RESPONSE;
     }
- 
+
+    // For comparison, we compute HMAC over the full command WITH timestamp
+    // (decoded)
+    cmdBase = receivedCmd;
+
+    // For STM32, strip off the timestamp part before sending the command
+    cmdToSTM = stripTimestamp(receivedCmd) + "\n";
+
+    if (cmdToSTM.startsWith("Download Firmware")) {
+      performDownload = true;
+    } else if (cmdToSTM == "Humidfier Fans ON" ||
+               cmdToSTM == "Humidfier Fans OFF") {
+      // Toggle fan state after verifying command
+    } else if (cmdToSTM == "Humidfier ON" || cmdToSTM == "Humidfier OFF") {
+      // Toggle humidifier state after verifying command
+    } else if (cmdToSTM == "End esp Task") {
+      // Automated mode command
+    }
+
     String receivedHmac = getPostValue(postData, "hmac");
 
     char localHmac[65] = {0};
@@ -74,7 +155,6 @@ void handleClient() {
           lastStatusMsg = "<p style='color:green;'>✅ Firmware downloaded "
                           "successfully.</p>";
 
-          // Prepare command string to STM32 via GPIO
           digitalWrite(DATA_PIN, HIGH);
           delay(1200);
           digitalWrite(DATA_PIN, LOW);
@@ -87,12 +167,11 @@ void handleClient() {
 
           Serial.println(
               "Start condition done, ready to send 'Download Firmware' bits");
-          handle_command_send(); // Force handle it now
+          handle_command_send();
 
           Serial.println(
               "✅ GPIO command finished, now uploading binary over UART");
-            
-          // After GPIO command is finished, do UART upload
+
           if (uploadToSTM32("/fackroun_project.bin")) {
             lastStatusMsg +=
                 "<p style='color:green;'>✅ Upload to STM32 completed.</p>";
@@ -105,10 +184,15 @@ void handleClient() {
               "<p style='color:red;'>❌ Firmware download failed.</p>";
         }
       } else {
-        if (postData.indexOf("command=toggle_fans") >= 0)
-          humidifierFansOn = !humidifierFansOn;
-        if (postData.indexOf("command=toggle_humidifier") >= 0)
-          humidifierOn = !humidifierOn;
+        // Toggle states accordingly
+        if (cmdToSTM == "Humidfier Fans ON")
+          humidifierFansOn = true;
+        else if (cmdToSTM == "Humidfier Fans OFF")
+          humidifierFansOn = false;
+        else if (cmdToSTM == "Humidfier ON")
+          humidifierOn = true;
+        else if (cmdToSTM == "Humidfier OFF")
+          humidifierOn = false;
 
         digitalWrite(DATA_PIN, HIGH);
         delay(1200);
@@ -118,7 +202,7 @@ void handleClient() {
         commandString = cmdToSTM;
         commandLen = commandString.length();
         sendingCommand = true;
-        bitIndex = 0; 
+        bitIndex = 0;
 
         Serial.println("Start condition done, ready to send command bits");
         lastStatusMsg = "<p style='color:green;'>✅ Command sent.</p>";
@@ -127,36 +211,70 @@ void handleClient() {
       Serial.println("❌ HMAC verification failed, ignoring command.");
       lastStatusMsg = "<p style='color:red;'>❌ HMAC verification failed.</p>";
     }
-  } 
+  }
 
-  String html = "<!DOCTYPE html><html><head><meta "
-                "charset=\"UTF-8\"><title>ESP8266 Control</title>"
-                "<style>button {padding: 20px; font-size: 18px; border: none; "
-                "border-radius: 8px;}"
-                ".on {background-color: green; color: white;}.off "
-                "{background-color: red; color: white;}"
-                "</style><script "
-                "src='https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/"
-                "crypto-js.min.js'></script>"
-                "<script>function generateHMAC(command, key) {return "
-                "CryptoJS.HmacSHA256(command, key).toString();}"
-                "function prepareForm(formId, command) {var key = "
-                "document.getElementById('key').value;"
-                "var hmac = generateHMAC(command, key);var form = "
-                "document.getElementById(formId);"
-                "form.querySelector('input[name=\"hmac\"]').value = "
-                "hmac;}</script></head><body>";
+SEND_RESPONSE:
+
+  String html =
+      "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>ESP8266 "
+      "Control</title>"
+      "<style>button {padding: 20px; font-size: 18px; border: none; "
+      "border-radius: 8px;} "
+      ".on {background-color: green; color: white;}.off {background-color: "
+      "red; color: white;}</style>"
+      "<script "
+      "src='https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/"
+      "crypto-js.min.js'></script>"
+      "<script>"
+      "function setKey() {"
+      "  var inputKey = prompt('Enter your secret key:');"
+      "  if (inputKey) {"
+      "    localStorage.setItem('espKey', inputKey);"
+      "    alert('Key saved locally! You can now use the buttons without "
+      "entering it again.');"
+      "  }"
+      "}"
+      "function generateHMAC(command, key) {"
+      "  return CryptoJS.HmacSHA256(command, key).toString();"
+      "}"
+      "function prepareForm(formId, command) {"
+      "  var key = localStorage.getItem('espKey');"
+      "  if (!key) {"
+      "    alert('Please set the key first using the Set Key button.');"
+      "    return false;"
+      "  }"
+      "  var timestamp = Math.floor(Date.now()/1000);"
+      "  var cmdWithTs = command + ';ts=' + timestamp;"
+      "  var hmac = generateHMAC(cmdWithTs, key);"
+      "  var form = document.getElementById(formId);"
+      "  form.querySelector('input[name=\"command\"]').value = "
+      "encodeURIComponent(cmdWithTs);"
+      "  form.querySelector('input[name=\"hmac\"]').value = hmac;"
+      "  return true;"
+      "}"
+      "function clearKey() {"
+      "  localStorage.removeItem('espKey');"
+      "  alert('Key cleared. Please set it again.');"
+      "}"
+      "</script></head><body>";
 
   handle_command_send();
 
   html += "<h1>ESP8266 Control Page</h1>";
   html += lastStatusMsg;
-  html += "Secret Key: <input type='text' id='key' name='key'><br><br>";
+
+  html += "<button onclick=\"setKey()\" style='background-color: purple; "
+          "color: white; padding: 10px; border-radius: 8px;'>Set Key</button> ";
+  html +=
+      "<button onclick=\"clearKey()\" style='background-color: gray; color: "
+      "white; padding: 10px; border-radius: 8px;'>Clear Key</button><br><br>";
 
   html +=
-      "<form id='fansForm' method='POST' onsubmit=\"prepareForm('fansForm', '" +
+      "<form id='fansForm' method='POST' onsubmit=\"return "
+      "prepareForm('fansForm', '" +
       String(humidifierFansOn ? "Humidfier Fans OFF" : "Humidfier Fans ON") +
       "')\">";
+  html += "<input type='hidden' name='command' value=''>";
   html += "<input type='hidden' name='hmac' id='fans_hmac'>";
   html += humidifierFansOn ? "<button class='on' type='submit' name='command' "
                              "value='toggle_fans'>Turn Fans OFF</button>"
@@ -164,9 +282,10 @@ void handleClient() {
                              "value='toggle_fans'>Turn Fans ON</button>";
   html += "</form>";
 
-  html += "<form id='humidifierForm' method='POST' "
-          "onsubmit=\"prepareForm('humidifierForm', '" +
+  html += "<form id='humidifierForm' method='POST' onsubmit=\"return "
+          "prepareForm('humidifierForm', '" +
           String(humidifierOn ? "Humidfier OFF" : "Humidfier ON") + "')\">";
+  html += "<input type='hidden' name='command' value=''>";
   html += "<input type='hidden' name='hmac' id='humidifier_hmac'>";
   html += humidifierOn
               ? "<button class='on' type='submit' name='command' "
@@ -175,15 +294,17 @@ void handleClient() {
                 "value='toggle_humidifier'>Turn Humidifier ON</button>";
   html += "</form>";
 
-  html += "<form id='autoForm' method='POST' "
-          "onsubmit=\"prepareForm('autoForm', 'End esp Task')\">";
+  html += "<form id='autoForm' method='POST' onsubmit=\"return "
+          "prepareForm('autoForm', 'End esp Task')\">";
+  html += "<input type='hidden' name='command' value=''>";
   html += "<input type='hidden' name='hmac' id='auto_hmac'>";
   html += "<button style='background-color: blue; color: white;' type='submit' "
           "name='command' value='automated_mode'>Automated Mode</button>";
   html += "</form>";
 
-  html += "<form id='downloadForm' method='POST' "
-          "onsubmit=\"prepareForm('downloadForm', 'Download Firmware')\">";
+  html += "<form id='downloadForm' method='POST' onsubmit=\"return "
+          "prepareForm('downloadForm', 'Download Firmware')\">";
+  html += "<input type='hidden' name='command' value=''>";
   html += "<input type='hidden' name='hmac' id='download_hmac'>";
   html +=
       "<button style='background-color: orange; color: white;' type='submit' "
