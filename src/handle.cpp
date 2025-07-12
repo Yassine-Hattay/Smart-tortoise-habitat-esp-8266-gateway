@@ -1,3 +1,4 @@
+
 #include "general.h"
 #include <Crypto.h>
 #include <Hash.h>
@@ -98,6 +99,7 @@ void handle_date_time() {
   }
 
   if (sendDataFlag && !sendingCommand) {
+    Serial.println("sending time data!!");
     sendDataFlag = false;
     if (bitIndex < timeStringLen * 8) {
       int byteIndex = bitIndex / 8;
