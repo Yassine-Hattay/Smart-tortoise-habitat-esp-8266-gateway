@@ -8,12 +8,66 @@ WiFiServer server(80);
 const char *ssid = "Orange-066C";
 const char *password = "GMA6ABLMG87";
 
+const unsigned long logInterval = 900'000; // 15 minutes in milliseconds
+
+void log_data() {
+  if (millis() - lastLogTime >= logInterval) {
+    lastLogTime = millis();
+
+    String logEntry = latestReceivedData;
+    appendLog(logEntry);
+    Serial.println("Logged: " + logEntry);
+  }
+}
+
+void handle_receive() {
+  static String buffer = "";
+  unsigned long startTime = millis();
+  const unsigned long timeout = 10'000; // 10 seconds
+  bool received_temp_humidity = false;
+
+  
+  while (!received_temp_humidity) {
+    yield(); // allow other tasks to run
+
+    // Check if data available on UART0 (Serial)
+    while (Serial.available()) {
+      char c = Serial.read();
+      buffer += c;
+
+      if (c == '\n') { // end of line
+        Serial.print("Received line: ");
+        Serial.print(buffer);
+        latestReceivedData = buffer; // update global display buffer
+
+        // Check format
+        if (buffer.startsWith("T1:") && buffer.indexOf("H1:") != -1 &&
+            buffer.indexOf("T2:") != -1 && buffer.indexOf("H2:") != -1) {
+          received_temp_humidity = true; // valid data flag
+          log_data();                    // ✅ only log if format matches
+        } else {
+          Serial.println("⚠️ Invalid format, skipping log.");
+        }
+
+        buffer = ""; // clear buffer
+        break;
+      }
+    }
+
+    // Check if timeout has passed
+    if (millis() - startTime > timeout) {
+      Serial.println("❌ Timeout waiting for data!");
+      buffer = ""; // reset buffer on timeout
+      break;
+    }
+  }
+}
+
 void setup() {
-  Serial.begin(115'200); 
+  Serial.begin(115'200);
   Serial1.begin(115'200, SERIAL_8N1, SERIAL_FULL, 2);
 
-  pinMode(CLOCK_PIN, INPUT);
-  pinMode(DATA_PIN, OUTPUT);
+  pinMode(DATA_PIN, INPUT);
   digitalWrite(DATA_PIN, LOW);
 
   if (!LittleFS.begin()) {
@@ -34,7 +88,7 @@ void setup() {
 
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 5000)) {
-    char buf[32];
+    char buf[40];
     snprintf(buf, sizeof(buf), "%02d/%02d/%04d %02d:%02d:%02d",
              timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
@@ -43,6 +97,10 @@ void setup() {
   } else {
     timeString = "Failed to get time\n";
     Serial.println("⚠️ Failed to get time in setup.");
+
+    // Restart ESP8266 after a short delay to avoid watchdog reset chaos
+    delay(1000);
+    ESP.restart();
   }
 
   timeStringLen = timeString.length();
@@ -87,10 +145,16 @@ void setup() {
 
   ArduinoOTA.begin();
   Serial.println("OTA ready V 69");
+
+  /*   if (LittleFS.format())
+      Serial.println("LittleFS formatted successfully.");
+    else
+      Serial.println("LittleFS format failed."); */
 }
 
 void loop() {
   ArduinoOTA.handle();
   handleClient();
-  handle_date_time();
+  handle_date_time_sending();
+  handle_receive();
 }

@@ -13,5 +13,6 @@ extern String timeString;
 extern int timeStringLen ;
 extern volatile int bitIndex;
 extern String commandString ;
+extern volatile bool sendDataFlag ;
 
 #endif // GENERAL_H
